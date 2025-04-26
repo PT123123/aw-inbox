@@ -1,0 +1,33 @@
+[package]
+name = "aw-inbox-rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror = "1.0"
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sqlx = { version = "0.7", features = [ "runtime-tokio-rustls", "sqlite", "chrono" ] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+tower-http = { version = "0.5", features = ["cors"] }
+http = "1.1"
+
+[dev-dependencies]
+hyper = { version = "0.14", features = ["server"] }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde_json = "1.0" # Ensure serde_json is also available for tests
+sqlx = { version = "0.7", features = [ "macros", "runtime-tokio-rustls", "sqlite" ] } # Add sqlx for migrations macro in tests
+mime = "0.3" # Add mime for content type header in tests
+tower = { version = "0.4", features = ["util"] } 
+thiserror = "1.0"
+log = "0.4"
+env_logger = "0.10"
+
+[[bin]]
+name = "aw-inbox"
+path = "src/main.rs"

@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "aw-inbox"
+version = "0.1.0"
+description = "Inbox module for ActivityWatch"
+authors = ["Your Name <your.email@example.com>"]
+license = "MPL-2.0"
+
+[tool.poetry.dependencies]
+python = "^3.8"
+Flask = "^2.0"
+
+[tool.poetry.scripts]
+aw-inbox = "aw_inbox.main:main"  # 保持与目录结构一致
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+# 👇 关键修复：直接使用表数组，无需提前声明 [tool.poetry.packages] 表
+[[tool.poetry.packages]]  # 直接声明表数组（移除多余的 [tool.poetry.packages] 行）
+include = "aw_inbox"     # 指向实际包目录（aw-inbox/aw_inbox）

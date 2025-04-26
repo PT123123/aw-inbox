@@ -1,0 +1,5 @@
+{
+  "exports": {
+    "./utils/tagUtils": "./src/utils/tagUtils.js"
+  }
+}
