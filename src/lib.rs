@@ -1,200 +1,155 @@
-pub mod models;
+use rocket::{Build, Rocket, get, post, put, delete, routes, State};
+use rocket::serde::json::Json;
+use rocket::http::Status;
+use rocket::response::status::Created;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
 pub mod db;
+mod models;
+use models::{Note, CreateNotePayload, UpdateNotePayload, NoteResponse, DetailedTag};
 
-use axum::{
-    routing::{get, post, put},
-    Router,
-    extract::{State, Json, Query, Path},
-    response::{IntoResponse, Response},
-    http::StatusCode,
-};
-use tower_http::cors::{Any, CorsLayer};
-use serde::Deserialize;
-use chrono::{DateTime, Utc};
-use crate::models::{CreateNotePayload, NoteResponse, UpdateNotePayload};
-use thiserror::Error;
+pub type SharedDb = Arc<Mutex<db::DbPool>>;
 
-#[derive(Clone)]
-pub struct AppState {
-    pub pool: db::DbPool,
-}
-
-#[derive(Deserialize, Debug)]
-struct GetNotesQuery {
-    limit: Option<i64>,
-    tag: Option<String>,
-    created_after: Option<DateTime<Utc>>,
-    created_before: Option<DateTime<Utc>>,
-}
-
-pub async fn app(db_pool: db::DbPool) -> Router {
-    let app_state = AppState { pool: db_pool };
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-    Router::new()
-        .route("/", get(root))
-        .route("/inbox/notes", post(create_note_handler).get(get_notes_handler))
-        .route("/inbox/notes/:note_id", get(get_note_handler).put(update_note_handler).delete(delete_note_handler))
-        .route("/inbox/tags", get(get_tags_handler))
-        .with_state(app_state)
-        .layer(cors)
-}
-
-async fn root() -> &'static str {
-    "📥 Welcome to Inbox Inbox Server (Rust Version)"
-}
-
-// --- API 处理程序 --- 
-
-// GET /inbox/notes/:note_id 处理程序
-async fn get_note_handler(
-    State(state): State<AppState>,
-    Path(note_id): Path<i64>,
-) -> Result<impl IntoResponse, AppError> {
-    match db::get_note_db(&state.pool, note_id).await? {
-        Some(note) => {
-            let response = NoteResponse {
-                id: note.id,
-                content: note.content,
-                tags: serde_json::from_str(&note.tags).unwrap_or_default(),
-                created_at: note.created_at.to_rfc3339(),
-                updated_at: note.updated_at.to_rfc3339(),
-            };
-            Ok(Json(response))
-        }
-        None => Err(AppError::NotFound("未找到指定的笔记".to_string())),
-    }
-}
-
-async fn get_notes_handler(
-    State(state): State<AppState>,
-    Query(params): Query<GetNotesQuery>,
-) -> Result<impl IntoResponse, AppError> {
-    let notes = db::get_notes_db(
-        &state.pool,
-        params.limit,
-        params.tag,
-        params.created_after,
-        params.created_before,
-    ).await?;
-    let response: Vec<NoteResponse> = notes
-        .into_iter()
-        .map(|note| NoteResponse {
-            id: note.id,
-            content: note.content,
-            tags: serde_json::from_str(&note.tags).unwrap_or_default(),
-            created_at: note.created_at.to_rfc3339(),
-            updated_at: note.updated_at.to_rfc3339(),
-        })
-        .collect();
-    Ok(Json(response))
-}
-
-async fn create_note_handler(
-    State(state): State<AppState>,
-    Json(payload): Json<CreateNotePayload>,
-) -> Result<impl IntoResponse, AppError> {
-    if payload.content.trim().is_empty() {
-        return Err(AppError::BadRequest("笔记内容不能为空".to_string()));
-    }
-    let note = db::create_note_db(&state.pool, payload).await?;
-    let response = NoteResponse {
+fn note_to_response(note: &Note) -> NoteResponse {
+    NoteResponse {
         id: note.id,
-        content: note.content,
+        content: note.content.clone(),
         tags: serde_json::from_str(&note.tags).unwrap_or_default(),
         created_at: note.created_at.to_rfc3339(),
         updated_at: note.updated_at.to_rfc3339(),
-    };
-    Ok((StatusCode::CREATED, Json(response)))
-}
-
-async fn update_note_handler(
-    State(state): State<AppState>,
-    Path(note_id): Path<i64>,
-    Json(payload): Json<UpdateNotePayload>,
-) -> Result<impl IntoResponse, AppError> {
-    if payload.content.trim().is_empty() {
-        return Err(AppError::BadRequest("笔记内容不能为空".to_string()));
-    }
-    match db::update_note_db(&state.pool, note_id, payload).await? {
-        Some(note) => {
-            let response = NoteResponse {
-                id: note.id,
-                content: note.content,
-                tags: serde_json::from_str(&note.tags).unwrap_or_default(),
-                created_at: note.created_at.to_rfc3339(),
-                updated_at: note.updated_at.to_rfc3339(),
-            };
-            Ok(Json(response))
-        }
-        None => Err(AppError::NotFound("未找到指定的笔记".to_string())),
     }
 }
 
-async fn delete_note_handler(
-    State(state): State<AppState>,
-    Path(note_id): Path<i64>,
-) -> Result<impl IntoResponse, AppError> {
-    let deleted = db::delete_note_db(&state.pool, note_id).await?;
-    if deleted {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(AppError::NotFound("未找到指定的笔记".to_string()))
-    }
-}
-
-// 错误类型定义
-use axum::Json as AxumJson;
-use serde_json::json;
-use sqlx;
-
-// GET /inbox/tags handler
-pub async fn get_tags_handler(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
-    match db::get_all_tags_db(&state.pool).await {
+#[get("/tags/detailed")]
+async fn get_detailed_tags(db: &State<SharedDb>) -> Result<Json<Vec<DetailedTag>>, Status> {
+    let pool = db.lock().await;
+    match db::get_detailed_tags_db(&*pool).await {
         Ok(tags) => Ok(Json(tags)),
         Err(e) => {
-            tracing::error!("get_all_tags_db error: {}", e);
-            Err(AppError::Internal("获取标签失败".to_string()))
+            let msg = format!("get_detailed_tags_db failed: {:?}", e);
+            eprintln!("[ERROR] {}", msg);
+            if msg.contains("no such table") {
+                return Err(Status::BadRequest);
+            }
+            Err(Status::InternalServerError)
         }
     }
 }
 
-#[derive(Debug, Error)]
-pub enum AppError {
-    #[error("{0}")]
-    BadRequest(String),
-    #[error("{0}")]
-    NotFound(String),
-    #[error("{0}")]
-    Internal(String),
-    #[error("{0}")]
-    DatabaseError(sqlx::Error)
-}
-
-impl From<sqlx::Error> for AppError {
-    fn from(err: sqlx::Error) -> Self {
-        match err {
-            sqlx::Error::RowNotFound => AppError::NotFound("未找到记录".to_string()),
-            _ => AppError::DatabaseError(err),
+#[get("/tags")]
+async fn get_tags(db: &State<SharedDb>) -> Result<Json<Vec<String>>, Status> {
+    let pool = db.lock().await;
+    match db::get_all_tags_db(&*pool).await {
+        Ok(tags) => Ok(Json(tags)),
+        Err(e) => {
+            let msg = format!("get_all_tags_db failed: {:?}", e);
+            eprintln!("[ERROR] {}", msg);
+            if msg.contains("no such table") {
+                return Err(Status::BadRequest);
+            }
+            Err(Status::InternalServerError)
         }
     }
 }
 
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        let (status_code, error_msg) = match self {
-            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
-            AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-            AppError::DatabaseError(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("数据库错误: {}", err)
-            ),
-        };
-        
-        let body = AxumJson(json!({ "error": error_msg }));
-        (status_code, body).into_response()
+pub fn mount_rocket(rocket: Rocket<Build>, db: SharedDb) -> Rocket<Build> {
+    rocket.manage(db).mount("/inbox", routes![
+        root,
+        create_note,
+        get_notes,
+        get_note,
+        update_note,
+        delete_note,
+        get_tags,
+        get_detailed_tags,
+    ])
+}
+
+#[get("/")]
+fn root() -> &'static str {
+    "📥 Welcome to Inbox Inbox Server (Rust Version)"
+}
+
+#[post("/notes", data = "<payload>", format = "json")]
+async fn create_note(db: &State<SharedDb>, payload: Json<CreateNotePayload>) -> Result<Created<Json<NoteResponse>>, Status> {
+    let pool = db.lock().await;
+    match db::create_note_db(&*pool, payload.into_inner()).await {
+        Ok(note) => Ok(Created::new("/inbox/notes").body(Json(note_to_response(&note)))),
+        Err(e) => {
+            let msg = format!("create_note_db failed: {:?}", e);
+            eprintln!("[ERROR] {}", msg);
+            if msg.contains("no such table") {
+                return Err(Status::BadRequest);
+            }
+            Err(Status::InternalServerError)
+        }
+    }
+}
+
+#[get("/notes")]
+async fn get_notes(db: &State<SharedDb>) -> Result<Json<Vec<NoteResponse>>, Status> {
+    let pool = db.lock().await;
+    match db::get_notes_db(&*pool, None, None, None, None).await {
+        Ok(notes) => Ok(Json(notes.iter().map(note_to_response).collect())),
+        Err(e) => {
+            let msg = format!("get_notes_db failed: {:?}", e);
+            eprintln!("[ERROR] {}", msg);
+            if msg.contains("no such table") {
+                return Err(Status::BadRequest);
+            }
+            Err(Status::InternalServerError)
+        }
+    }
+}
+
+#[get("/notes/<id>")]
+async fn get_note(db: &State<SharedDb>, id: i64) -> Result<Json<NoteResponse>, Status> {
+    let pool = db.lock().await;
+    match db::get_note_db(&*pool, id).await {
+        Ok(Some(note)) => Ok(Json(note_to_response(&note))),
+        Ok(None) => Err(Status::NotFound),
+        Err(e) => {
+            let msg = format!("get_note_db failed: {:?}", e);
+            eprintln!("[ERROR] {}", msg);
+            if msg.contains("no such table") {
+                return Err(Status::BadRequest);
+            }
+            Err(Status::InternalServerError)
+        }
+    }
+}
+
+#[put("/notes/<id>", data = "<payload>", format = "json")]
+async fn update_note(db: &State<SharedDb>, id: i64, payload: Json<UpdateNotePayload>) -> Result<Json<NoteResponse>, Status> {
+    let pool = db.lock().await;
+    match db::update_note_db(&*pool, id, payload.into_inner()).await {
+        Ok(Some(note)) => Ok(Json(note_to_response(&note))),
+        Ok(None) => Err(Status::NotFound),
+        Err(e) => {
+            let msg = format!("update_note_db failed: {:?}", e);
+            eprintln!("[ERROR] {}", msg);
+            if msg.contains("no such table") {
+                return Err(Status::BadRequest);
+            }
+            Err(Status::InternalServerError)
+        }
+    }
+}
+
+#[delete("/notes/<id>")]
+async fn delete_note(db: &State<SharedDb>, id: i64) -> Result<Status, Status> {
+    let pool = db.lock().await;
+    match db::delete_note_db(&*pool, id).await {
+        Ok(true) => Ok(Status::NoContent),
+        Ok(false) => Err(Status::NotFound),
+        Err(e) => {
+            let msg = format!("delete_note_db failed: {:?}", e);
+            eprintln!("[ERROR] {}", msg);
+            if msg.contains("no such table") {
+                return Err(Status::BadRequest);
+            }
+            Err(Status::InternalServerError)
+        }
     }
 }

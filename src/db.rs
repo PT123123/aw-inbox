@@ -15,11 +15,11 @@ pub async fn init_pool() -> Result<DbPool, Error> {
     let database_url = env::var(DATABASE_URL_ENV_VAR)
         .unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string());
 
-    tracing::info!("🗄️ 连接到数据库: {}", database_url);
+    println!("🗄️ 连接到数据库: {}", database_url);
 
     // 确保数据库文件存在，如果不存在则创建
     if !std::path::Path::new(database_url.trim_start_matches("sqlite:")).exists() {
-        tracing::info!("数据库文件不存在，正在创建...");
+        println!("数据库文件不存在，正在创建...");
         std::fs::File::create(database_url.trim_start_matches("sqlite:"))
             .map_err(|e| sqlx::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
     }
@@ -65,7 +65,7 @@ pub async fn migrate(pool: &DbPool) -> Result<(), Error> {
         );
         "#
     ).execute(pool).await?;
-    tracing::info!("✅ 数据库迁移完成");
+    println!("✅ 数据库迁移完成");
     Ok(())
 }
 
@@ -240,6 +240,35 @@ pub async fn get_all_tags_db(pool: &DbPool) -> Result<Vec<String>, Error> {
         }
     }
     Ok(tag_set.into_iter().collect())
+}
+
+// 获取详细标签信息
+use crate::models::DetailedTag;
+use sqlx::Row;
+
+pub async fn get_detailed_tags_db(pool: &DbPool) -> Result<Vec<DetailedTag>, Error> {
+    let rows = sqlx::query(
+        r#"
+        SELECT json_each.value as tag, COUNT(*) as count, MAX(updated_at) as last_modified
+        FROM notes, json_each(notes.tags)
+        GROUP BY tag
+        ORDER BY count DESC
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut result = Vec::new();
+    for row in rows {
+        let name: String = row.get("tag");
+        let count: i64 = row.get("count");
+        let last_modified: Option<String> = row.get("last_modified");
+        result.push(DetailedTag {
+            name,
+            count,
+            last_modified,
+        });
+    }
+    Ok(result)
 }
 
 // 后续将在此处添加数据库操作函数，例如：

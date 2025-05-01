@@ -22,7 +22,7 @@ fn test_server_add_note() {
     thread::sleep(Duration::from_secs(5));
 
     let client = Client::new();
-    let url = "http://127.0.0.1:5061/inbox/notes";
+    let url = "http://127.0.0.1:5600/inbox/notes";
     let payload = serde_json::json!({
         "content": "integration http test note",
         "tags": ["http", "integration"]
