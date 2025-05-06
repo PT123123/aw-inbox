@@ -1,276 +1,299 @@
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool, Error};
+// src/db.rs
+use rusqlite::{params, Connection, Error, Row, ToSql}; // Ensure rusqlite is in Cargo.toml!
 use std::env;
-use crate::models::{Note, CreateNotePayload, UpdateNotePayload};
+use std::path::Path;
+use crate::models::{Note, CreateNotePayload, UpdateNotePayload, DetailedTag}; // Ensure Note has tags: Vec<String>
 use chrono::{DateTime, Utc};
+use serde_json;
 
-// 数据库连接池类型别名
-pub type DbPool = SqlitePool;
+// --- 错误处理助手 ---
+fn map_serde_error(e: serde_json::Error) -> Error {
+    Error::InvalidParameterName(format!("JSON serialization/deserialization error: {}", e))
+}
 
-// 数据库文件路径，可以从环境变量读取或使用默认值
+// --- 数据库连接类型 ---
+pub type DbConnection = Connection;
+
+// --- 常量 ---
 const DATABASE_URL_ENV_VAR: &str = "DATABASE_URL";
-const DEFAULT_DATABASE_URL: &str = "sqlite:inbox.db"; // 默认指向项目根目录的 inbox.db
+const DEFAULT_DATABASE_URL: &str = "inbox.db";
 
-// 初始化数据库连接池
-pub async fn init_pool() -> Result<DbPool, Error> {
-    let database_url = env::var(DATABASE_URL_ENV_VAR)
-        .unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string());
+// --- 初始化 ---
+pub async fn init_pool() -> Result<DbConnection, Error> {
+    let database_url = if cfg!(target_os = "android") {
+        // Android环境下使用应用私有数据目录
+        let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| ".".to_string());
+        let db_path = Path::new(&data_dir).join(DEFAULT_DATABASE_URL);
+        
+        // 确保父目录存在
+        if let Some(parent) = db_path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent).map_err(|e| Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                    Some(format!("Failed to create parent directory: {}", e)),
+                ))?;
+            }
+        }
+        
+        db_path.to_string_lossy().into_owned()
+    } else {
+        // 非Android环境保持原有逻辑
+        env::var(DATABASE_URL_ENV_VAR)
+            .unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string())
+    };
 
-    println!("🗄️ 连接到数据库: {}", database_url);
+    println!("🗄️ 连接到数据库 (同步): {}", database_url);
 
-    // 确保数据库文件存在，如果不存在则创建
-    if !std::path::Path::new(database_url.trim_start_matches("sqlite:")).exists() {
-        println!("数据库文件不存在，正在创建...");
-        std::fs::File::create(database_url.trim_start_matches("sqlite:"))
-            .map_err(|e| sqlx::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-    }
-
-    let pool = SqlitePoolOptions::new()
-        .max_connections(5) // 根据需要调整连接池大小
-        .connect(&database_url)
-        .await?;
-
-    Ok(pool)
+    let db_path = Path::new(&database_url);
+    let conn = Connection::open(db_path)?;
+    conn.execute("PRAGMA foreign_keys = ON;", [])?;
+    Ok(conn)
 }
 
-// 初始化测试数据库连接池
-pub async fn init_db(database_url: &str) -> Result<DbPool, Error> {
-    let pool = SqlitePoolOptions::new()
-        .max_connections(5)
-        .connect(database_url)
-        .await?;
-    Ok(pool)
-}
-
-pub async fn migrate(pool: &DbPool) -> Result<(), Error> {
-    sqlx::query(
+// --- 迁移 ---
+pub fn migrate(conn: &DbConnection) -> Result<(), Error> {
+    conn.execute_batch(
         r#"
+        BEGIN;
         CREATE TABLE IF NOT EXISTS notes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             content TEXT NOT NULL,
             tags TEXT DEFAULT '[]',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         );
-        "#
-    ).execute(pool).await?;
-
-    sqlx::query(
-        r#"
         CREATE TABLE IF NOT EXISTS comments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             note_id INTEGER NOT NULL,
             content TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
             FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE
         );
+        COMMIT;
         "#
-    ).execute(pool).await?;
+    )?;
+    
     println!("✅ 数据库迁移完成");
     Ok(())
 }
 
+// --- 笔记的 CRUD 操作 ---
 
-// 创建新笔记
-pub async fn create_note_db(pool: &DbPool, payload: CreateNotePayload) -> Result<Note, Error> {
-    let created_at = payload.created_at.unwrap_or_else(Utc::now);
-    let updated_at = created_at; // 初始创建时，更新时间等于创建时间
-    let tags_json = serde_json::to_string(&payload.tags.unwrap_or_default())
-        .map_err(|e| sqlx::Error::Decode(Box::new(e)))?; // 将 Vec<String> 序列化为 JSON 字符串
+fn map_row_to_note(row: &Row) -> Result<Note, Error> {
+    let tags_json: String = row.get("tags")?;
+    // Assuming Note in models.rs has tags: Vec<String>
+    let tags: Vec<String> = serde_json::from_str(&tags_json).map_err(map_serde_error)?;
+    let created_at: DateTime<Utc> = row.get("created_at")?;
+    let updated_at: DateTime<Utc> = row.get("updated_at")?;
 
-    let result = sqlx::query(
-        r#"
-        INSERT INTO notes (content, tags, created_at, updated_at)
-        VALUES (?, ?, ?, ?)
-        "#
-    )
-    .bind(&payload.content)
-    .bind(&tags_json)
-    .bind(created_at)
-    .bind(updated_at)
-    .execute(pool)
-    .await?;
-
-    let id = result.last_insert_rowid();
-
-    // 返回创建的笔记对象
     Ok(Note {
-        id,
-        content: payload.content,
-        tags: tags_json,
+        id: row.get("id")?,
+        content: row.get("content")?,
+        tags, // Store parsed Vec<String>
         created_at,
         updated_at,
     })
 }
 
-// 获取单条笔记
-pub async fn get_note_db(pool: &DbPool, note_id: i64) -> Result<Option<Note>, Error> {
-    let note = sqlx::query_as::<_, Note>(
-        "SELECT id, content, tags, created_at, updated_at FROM notes WHERE id = ?"
-    )
-    .bind(note_id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(note)
+pub fn create_note_db(conn: &mut DbConnection, payload: CreateNotePayload) -> Result<Note, Error> {
+    let created_at = payload.created_at.unwrap_or_else(Utc::now);
+    let updated_at = created_at;
+    let tags_json = serde_json::to_string(&payload.tags.unwrap_or_default())
+        .map_err(map_serde_error)?;
+
+    let tx = conn.transaction()?;
+    tx.execute(
+        r#"
+        INSERT INTO notes (content, tags, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4)
+        "#,
+        params![
+            payload.content,
+            tags_json,
+            created_at,
+            updated_at,
+        ],
+    )?;
+
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
+
+    let parsed_tags: Vec<String> = serde_json::from_str(&tags_json).map_err(map_serde_error)?;
+
+    Ok(Note {
+        id,
+        content: payload.content,
+        tags: parsed_tags, // Ensure Note struct expects Vec<String>
+        created_at,
+        updated_at,
+    })
 }
 
-// 获取笔记列表 (带过滤和分页)
-pub async fn get_notes_db(
-    pool: &DbPool,
+pub fn get_note_db(conn: &DbConnection, note_id: i64) -> Result<Option<Note>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, content, tags, created_at, updated_at FROM notes WHERE id = ?1"
+    )?;
+    let result = stmt.query_row(params![note_id], map_row_to_note);
+
+    match result {
+        Ok(note) => Ok(Some(note)),
+        Err(Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+pub fn get_notes_db(
+    conn: &DbConnection,
     limit: Option<i64>,
     tag: Option<String>,
     created_after: Option<DateTime<Utc>>,
     created_before: Option<DateTime<Utc>>,
 ) -> Result<Vec<Note>, Error> {
     let mut query_str = "SELECT id, content, tags, created_at, updated_at FROM notes WHERE 1=1".to_string();
-    let mut conditions = Vec::<String>::new();
+    let mut params_vec: Vec<Box<dyn ToSql>> = Vec::new();
 
-    if tag.is_some() {
-        conditions.push("tags LIKE ?".to_string());
+    if let Some(t) = tag {
+        query_str.push_str(" AND tags LIKE ?");
+        params_vec.push(Box::new(format!("%\"{}\"%", t)));
     }
-    if created_after.is_some() {
-        conditions.push("created_at >= ?".to_string());
+    if let Some(after) = created_after {
+        query_str.push_str(" AND created_at >= ?");
+        params_vec.push(Box::new(after));
     }
-    if created_before.is_some() {
-        conditions.push("created_at < ?".to_string());
-    }
-
-    if !conditions.is_empty() {
-        query_str.push_str(" AND ");
-        query_str.push_str(&conditions.join(" AND "));
+    if let Some(before) = created_before {
+        query_str.push_str(" AND created_at < ?");
+        params_vec.push(Box::new(before));
     }
 
     query_str.push_str(" ORDER BY created_at DESC");
 
     if let Some(l) = limit {
-        query_str.push_str(&format!(" LIMIT {}", l)); // LIMIT 不接受占位符
+        query_str.push_str(&format!(" LIMIT {}", l));
     }
 
-    // 使用 query_as! 构建查询
-    let mut query = sqlx::query_as::<_, Note>(&query_str);
-
-    // 按顺序绑定参数
-    if let Some(t) = tag {
-        query = query.bind(format!("%\"{}\"%", t));
-    }
-    if let Some(after) = created_after {
-        query = query.bind(after);
-    }
-    if let Some(before) = created_before {
-        query = query.bind(before);
+    let mut final_query_str = String::new();
+    let mut param_index = 1;
+    for c in query_str.chars() {
+        if c == '?' {
+            final_query_str.push_str(&format!("?{}", param_index));
+            param_index += 1;
+        } else {
+            final_query_str.push(c);
+        }
     }
 
-    // 执行查询
-    let notes = query.fetch_all(pool).await?;
+    let mut stmt = conn.prepare(&final_query_str)?;
+    let params_ref: Vec<&dyn ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+
+    // *** MUST FIX THIS LINE LOCALLY: Remove '¶', use 'params_ref' ***
+    let notes_iter = stmt.query_map(&params_ref[..], map_row_to_note)?;
+
+    let mut notes = Vec::new();
+    for note_result in notes_iter {
+        notes.push(note_result?);
+    }
 
     Ok(notes)
 }
 
-// 更新笔记
-pub async fn update_note_db(
-    pool: &DbPool,
+pub fn update_note_db(
+    conn: &mut DbConnection,
     note_id: i64,
     payload: UpdateNotePayload,
 ) -> Result<Option<Note>, Error> {
     let updated_at = Utc::now();
     let tags_json = serde_json::to_string(&payload.tags.unwrap_or_default())
-        .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+        .map_err(map_serde_error)?;
 
-    let result = sqlx::query(
+    let rows_affected = conn.execute(
         r#"
         UPDATE notes
-        SET content = ?, tags = ?, updated_at = ?
-        WHERE id = ?
-        "#
-    )
-    .bind(&payload.content)
-    .bind(&tags_json)
-    .bind(updated_at)
-    .bind(note_id)
-    .execute(pool)
-    .await?;
+        SET content = ?1, tags = ?2, updated_at = ?3
+        WHERE id = ?4
+        "#,
+        params![
+            payload.content,
+            tags_json,
+            updated_at,
+            note_id
+        ],
+    )?;
 
-    if result.rows_affected() == 0 {
-        // 如果没有行被更新，说明笔记不存在
-        return Ok(None);
+    if rows_affected == 0 {
+        Ok(None)
+    } else {
+        get_note_db(conn, note_id)
     }
-
-    // 获取并返回更新后的笔记
-    let updated_note = sqlx::query_as::<_, Note>(
-        "SELECT id, content, tags, created_at, updated_at FROM notes WHERE id = ?"
-    )
-    .bind(note_id)
-    .fetch_one(pool)
-    .await?;
-
-    Ok(Some(updated_note))
 }
 
-// 删除笔记
-pub async fn delete_note_db(pool: &DbPool, note_id: i64) -> Result<bool, Error> {
-    // 首先删除关联的评论 (如果需要保持外键约束)
-    sqlx::query("DELETE FROM comments WHERE note_id = ?")
-        .bind(note_id)
-        .execute(pool)
-        .await?;
-
-    // 然后删除笔记本身
-    let result = sqlx::query("DELETE FROM notes WHERE id = ?")
-        .bind(note_id)
-        .execute(pool)
-        .await?;
-
-    // 如果有行被删除，则返回 true
-    Ok(result.rows_affected() > 0)
+pub fn delete_note_db(conn: &mut DbConnection, note_id: i64) -> Result<bool, Error> {
+    let rows_affected = conn.execute(
+        "DELETE FROM notes WHERE id = ?1",
+        params![note_id],
+    )?;
+    Ok(rows_affected > 0)
 }
 
+// --- 标签操作 ---
 
-// 获取所有唯一标签
-pub async fn get_all_tags_db(pool: &DbPool) -> Result<Vec<String>, Error> {
-    use sqlx::Row;
-    let rows = sqlx::query("SELECT tags FROM notes WHERE tags IS NOT NULL")
-        .fetch_all(pool)
-        .await?;
+pub fn get_all_tags_db(conn: &DbConnection) -> Result<Vec<String>, Error> {
+    let mut stmt = conn.prepare("SELECT tags FROM notes WHERE json_valid(tags) AND json_type(tags) = 'array'")?;
+    let rows_iter = stmt.query_map(params![], |row| row.get::<_, String>(0))?;
+
+    // *** Attempt to fix E0277 by collecting results first ***
+    let tags_json_results: Vec<Result<String, Error>> = rows_iter.collect();
+
     let mut tag_set = std::collections::HashSet::new();
-    for row in rows {
-        let tags_json: String = row.get(0);
-        if let Ok(tags) = serde_json::from_str::<Vec<String>>(&tags_json) {
-            for tag in tags {
-                tag_set.insert(tag);
+    for row_result in tags_json_results {
+        match row_result {
+            Ok(tags_json) => { // tags_json is String
+                if let Ok(tags) = serde_json::from_str::<Vec<String>>(&tags_json) {
+                     for tag in tags {
+                        tag_set.insert(tag);
+                    }
+                } else {
+                     eprintln!("警告：无法从数据库解析标签 JSON：{}", tags_json);
+                }
+            }
+            Err(e) => {
+                // Propagate error from collection step
+                return Err(e);
             }
         }
     }
     Ok(tag_set.into_iter().collect())
 }
 
-// 获取详细标签信息
-use crate::models::DetailedTag;
-use sqlx::Row;
 
-pub async fn get_detailed_tags_db(pool: &DbPool) -> Result<Vec<DetailedTag>, Error> {
-    let rows = sqlx::query(
+pub fn get_detailed_tags_db(conn: &DbConnection) -> Result<Vec<DetailedTag>, Error> {
+    let mut stmt = conn.prepare(
         r#"
-        SELECT json_each.value as tag, COUNT(*) as count, MAX(updated_at) as last_modified
-        FROM notes, json_each(notes.tags)
-        GROUP BY tag
-        ORDER BY count DESC
+        SELECT
+            jt.value as tag_name,
+            COUNT(*) as count,
+            MAX(n.updated_at) as last_modified
+        FROM
+            notes n, json_each(n.tags) jt
+        WHERE json_valid(n.tags) AND json_type(n.tags) = 'array'
+        GROUP BY
+            jt.value
+        ORDER BY
+            count DESC;
         "#
-    )
-    .fetch_all(pool)
-    .await?;
-    let mut result = Vec::new();
-    for row in rows {
-        let name: String = row.get("tag");
-        let count: i64 = row.get("count");
-        let last_modified: Option<String> = row.get("last_modified");
-        result.push(DetailedTag {
-            name,
-            count,
+    )?;
+
+    let tag_iter = stmt.query_map(params![], |row| {
+        let last_modified: Option<DateTime<Utc>> = row.get("last_modified")?;
+        Ok(DetailedTag {
+            name: row.get("tag_name")?,
+            count: row.get("count")?,
             last_modified,
-        });
+        })
+    })?;
+
+    let mut result = Vec::new();
+    for tag_result in tag_iter {
+        result.push(tag_result?);
     }
     Ok(result)
 }
-
-// 后续将在此处添加数据库操作函数，例如：
-// pub async fn get_tags_db(...) -> Result<Vec<Tag>, Error> { ... }
-// ... 等等
