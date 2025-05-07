@@ -7,6 +7,7 @@ use rocket::response::status::Created;
 use std::sync::Arc;
 use std::sync::Mutex; // Use std::sync::Mutex
 use tokio::task; // For spawn_blocking
+use rocket::form::FromForm;
 
 pub mod db;
 mod models;
@@ -206,14 +207,27 @@ async fn create_note(db_state: &State<SharedDb>, payload: Json<CreateNotePayload
     Ok(Created::new("/inbox/notes").body(Json(note_to_response(&created_note))))
 }
 
+#[derive(FromForm)]
+struct NotesQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+    tag: Option<String>,
+    search: Option<String>,
+    sort_by: Option<String>,
+}
 
-#[get("/notes")]
-async fn get_notes(db_state: &State<SharedDb>) -> Result<Json<Vec<NoteResponse>>, Status> {
-     let db_arc = db_state.inner().clone();
-
+#[get("/notes?<query..>")]
+async fn get_notes(db_state: &State<SharedDb>, query: NotesQuery) -> Result<Json<Vec<NoteResponse>>, Status> {
+    let db_arc = db_state.inner().clone();
+    
+    // 接收查询参数
+    let limit = query.limit;
+    let tag = query.tag;
+    let search = query.search;
+    
     let notes = task::spawn_blocking(move || {
         let conn = db_arc.lock().map_err(|_| Status::InternalServerError)?;
-        db::get_notes_db(&conn, None, None, None, None)
+        db::get_notes_db(&conn, limit, tag, None, None, search)
             .map_err(handle_db_error)
     })
     .await

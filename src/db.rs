@@ -161,6 +161,7 @@ pub fn get_notes_db(
     tag: Option<String>,
     created_after: Option<DateTime<Utc>>,
     created_before: Option<DateTime<Utc>>,
+    search: Option<String>,
 ) -> Result<Vec<Note>, Error> {
     let mut query_str = "SELECT id, content, tags, created_at, updated_at FROM notes WHERE 1=1".to_string();
     let mut params_vec: Vec<Box<dyn ToSql>> = Vec::new();
@@ -176,6 +177,11 @@ pub fn get_notes_db(
     if let Some(before) = created_before {
         query_str.push_str(" AND created_at < ?");
         params_vec.push(Box::new(before));
+    }
+    if let Some(s) = search {
+        // 使用 LIKE 在内容中搜索（将搜索词包裹在通配符 % 中）
+        query_str.push_str(" AND content LIKE ?");
+        params_vec.push(Box::new(format!("%{}%", s)));
     }
 
     query_str.push_str(" ORDER BY created_at DESC");
