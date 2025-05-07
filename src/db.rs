@@ -1,8 +1,9 @@
 // src/db.rs
 use rusqlite::{params, Connection, Error, Row, ToSql}; // Ensure rusqlite is in Cargo.toml!
+use rusqlite::OptionalExtension; // 添加OptionalExtension trait
 use std::env;
 use std::path::Path;
-use crate::models::{Note, CreateNotePayload, UpdateNotePayload, DetailedTag}; // Ensure Note has tags: Vec<String>
+use crate::models::{Note, CreateNotePayload, UpdateNotePayload, DetailedTag, NoteRelation, NoteRelationType, CreateNoteRelationPayload, CreateCommentPayload}; // Updated imports
 use chrono::{DateTime, Utc};
 use serde_json;
 
@@ -62,13 +63,25 @@ pub fn migrate(conn: &DbConnection) -> Result<(), Error> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS comments (
+        
+        -- 删除旧的comments表（如果存在）
+        DROP TABLE IF EXISTS comments;
+        
+        -- 创建笔记关系表
+        CREATE TABLE IF NOT EXISTS note_relations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            note_id INTEGER NOT NULL,
-            content TEXT NOT NULL,
+            source_note_id INTEGER NOT NULL,
+            target_note_id INTEGER NOT NULL,
+            relation_type TEXT NOT NULL, -- 'Comment', 'Reference', 'Link' 等
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-            FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE
+            FOREIGN KEY (source_note_id) REFERENCES notes(id) ON DELETE CASCADE,
+            FOREIGN KEY (target_note_id) REFERENCES notes(id) ON DELETE CASCADE
         );
+        
+        -- 创建索引以提高查询性能
+        CREATE INDEX IF NOT EXISTS idx_note_relations_source ON note_relations(source_note_id);
+        CREATE INDEX IF NOT EXISTS idx_note_relations_target ON note_relations(target_note_id);
+        CREATE INDEX IF NOT EXISTS idx_note_relations_type ON note_relations(relation_type);
         COMMIT;
         "#
     )?;
@@ -296,4 +309,208 @@ pub fn get_detailed_tags_db(conn: &DbConnection) -> Result<Vec<DetailedTag>, Err
         result.push(tag_result?);
     }
     Ok(result)
+}
+
+// --- 笔记关系操作 ---
+
+fn map_row_to_relation(row: &Row) -> Result<NoteRelation, Error> {
+    let relation_type_str: String = row.get("relation_type")?;
+    let relation_type = match relation_type_str.as_str() {
+        "Comment" => NoteRelationType::Comment,
+        "Reference" => NoteRelationType::Reference,
+        "Link" => NoteRelationType::Link,
+        _ => NoteRelationType::Reference, // 默认值
+    };
+
+    Ok(NoteRelation {
+        id: row.get("id")?,
+        source_note_id: row.get("source_note_id")?,
+        target_note_id: row.get("target_note_id")?,
+        relation_type,
+        created_at: row.get("created_at")?,
+    })
+}
+
+// 获取指向特定笔记的所有关系
+pub fn get_relations_for_note_db(conn: &DbConnection, note_id: i64, relation_type: Option<NoteRelationType>) -> Result<Vec<NoteRelation>, Error> {
+    let mut query = String::from(
+        "SELECT id, source_note_id, target_note_id, relation_type, created_at 
+         FROM note_relations 
+         WHERE target_note_id = ?"
+    );
+    
+    let mut params_vec: Vec<Box<dyn ToSql>> = Vec::new();
+    params_vec.push(Box::new(note_id));
+    
+    let relation_type_str = match &relation_type {
+        Some(rt) => match rt {
+            NoteRelationType::Comment => Some("Comment"),
+            NoteRelationType::Reference => Some("Reference"),
+            NoteRelationType::Link => Some("Link"),
+        },
+        None => None,
+    };
+    
+    if relation_type_str.is_some() {
+        query.push_str(" AND relation_type = ?");
+        params_vec.push(Box::new(relation_type_str.unwrap()));
+    }
+    
+    query.push_str(" ORDER BY created_at");
+    
+    let mut stmt = conn.prepare(&query)?;
+    let params_ref: Vec<&dyn ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+    
+    let relations_iter = stmt.query_map(&params_ref[..], map_row_to_relation)?;
+    
+    let mut relations = Vec::new();
+    for relation_result in relations_iter {
+        relations.push(relation_result?);
+    }
+    
+    Ok(relations)
+}
+
+// 获取特定笔记的所有评论（作为关系的源笔记）
+pub fn get_comments_for_note_db(conn: &DbConnection, note_id: i64) -> Result<Vec<(Note, NoteRelation)>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT n.id, n.content, n.tags, n.created_at, n.updated_at, 
+                r.id as relation_id, r.source_note_id, r.target_note_id, r.relation_type, r.created_at as relation_created_at
+         FROM notes n
+         JOIN note_relations r ON n.id = r.source_note_id
+         WHERE r.target_note_id = ? AND r.relation_type = 'Comment'
+         ORDER BY r.created_at"
+    )?;
+    
+    let results_iter = stmt.query_map(params![note_id], |row| {
+        let tags_json: String = row.get("tags")?;
+        let tags: Vec<String> = serde_json::from_str(&tags_json).map_err(map_serde_error)?;
+        
+        let note = Note {
+            id: row.get("id")?,
+            content: row.get("content")?,
+            tags,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+        };
+        
+        let relation = NoteRelation {
+            id: row.get("relation_id")?,
+            source_note_id: row.get("source_note_id")?,
+            target_note_id: row.get("target_note_id")?,
+            relation_type: NoteRelationType::Comment,
+            created_at: row.get("relation_created_at")?,
+        };
+        
+        Ok((note, relation))
+    })?;
+    
+    let mut results = Vec::new();
+    for result in results_iter {
+        results.push(result?);
+    }
+    
+    Ok(results)
+}
+
+// 创建笔记关系
+pub fn create_note_relation_db(conn: &mut DbConnection, source_note_id: i64, target_note_id: i64, payload: CreateNoteRelationPayload) -> Result<NoteRelation, Error> {
+    // 先检查两个笔记是否存在
+    let source_exists = conn.query_row(
+        "SELECT 1 FROM notes WHERE id = ? LIMIT 1",
+        params![source_note_id],
+        |_| Ok(true)
+    ).optional()?.unwrap_or(false);
+    
+    let target_exists = conn.query_row(
+        "SELECT 1 FROM notes WHERE id = ? LIMIT 1",
+        params![target_note_id],
+        |_| Ok(true)
+    ).optional()?.unwrap_or(false);
+    
+    if !source_exists || !target_exists {
+        return Err(Error::QueryReturnedNoRows);
+    }
+    
+    let relation_type_str = match payload.relation_type {
+        NoteRelationType::Comment => "Comment",
+        NoteRelationType::Reference => "Reference",
+        NoteRelationType::Link => "Link",
+    };
+    
+    let created_at = Utc::now();
+    
+    conn.execute(
+        "INSERT INTO note_relations (source_note_id, target_note_id, relation_type, created_at) VALUES (?, ?, ?, ?)",
+        params![source_note_id, target_note_id, relation_type_str, created_at],
+    )?;
+    
+    let id = conn.last_insert_rowid();
+    
+    Ok(NoteRelation {
+        id,
+        source_note_id,
+        target_note_id,
+        relation_type: payload.relation_type,
+        created_at,
+    })
+}
+
+// 添加评论（创建一个笔记并建立评论关系）
+pub fn add_comment_db(conn: &mut DbConnection, target_note_id: i64, payload: CreateCommentPayload) -> Result<(Note, NoteRelation), Error> {
+    // 检查目标笔记是否存在
+    let target_exists = conn.query_row(
+        "SELECT 1 FROM notes WHERE id = ? LIMIT 1",
+        params![target_note_id],
+        |_| Ok(true)
+    ).optional()?.unwrap_or(false);
+    
+    if !target_exists {
+        return Err(Error::QueryReturnedNoRows);
+    }
+    
+    // 开始事务
+    let tx = conn.transaction()?;
+    
+    // 1. 首先创建评论笔记
+    let created_at = Utc::now();
+    let updated_at = created_at;
+    let tags = payload.tags.unwrap_or_default();
+    let tags_json = serde_json::to_string(&tags).map_err(map_serde_error)?;
+    
+    tx.execute(
+        "INSERT INTO notes (content, tags, created_at, updated_at) VALUES (?, ?, ?, ?)",
+        params![payload.content, tags_json, created_at, updated_at],
+    )?;
+    
+    let comment_note_id = tx.last_insert_rowid();
+    
+    // 2. 创建评论关系
+    tx.execute(
+        "INSERT INTO note_relations (source_note_id, target_note_id, relation_type, created_at) VALUES (?, ?, ?, ?)",
+        params![comment_note_id, target_note_id, "Comment", created_at],
+    )?;
+    
+    let relation_id = tx.last_insert_rowid();
+    
+    // 提交事务
+    tx.commit()?;
+    
+    // 返回新创建的笔记和关系
+    Ok((
+        Note {
+            id: comment_note_id,
+            content: payload.content,
+            tags,
+            created_at,
+            updated_at,
+        },
+        NoteRelation {
+            id: relation_id,
+            source_note_id: comment_note_id,
+            target_note_id,
+            relation_type: NoteRelationType::Comment,
+            created_at,
+        }
+    ))
 }

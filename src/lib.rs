@@ -13,6 +13,8 @@ mod models;
 // Ensure models.rs has correct Note/NoteResponse definitions (tags: Vec<String>)
 use models::{Note, CreateNotePayload, NoteResponse, DetailedTag};
 use crate::models::UpdateNotePayload;
+// 添加评论相关模型
+use crate::models::{NoteRelation, NoteRelationType, CreateNoteRelationPayload, CreateCommentPayload};
 // 删除未使用的导入
 // use crate::db::DbConnection;
 
@@ -81,6 +83,79 @@ async fn get_tags(db_state: &State<SharedDb>) -> Result<Json<Vec<String>>, Statu
     .map(Json)
 }
 
+// 获取笔记的评论
+#[get("/notes/<note_id>/comments")]
+async fn get_comments(db_state: &State<SharedDb>, note_id: i64) -> Result<Json<Vec<NoteResponse>>, Status> {
+    let db_arc = db_state.inner().clone();
+    
+    let comments_with_relations = task::spawn_blocking(move || {
+        let conn = db_arc.lock().map_err(|_| Status::InternalServerError)?;
+        db::get_comments_for_note_db(&conn, note_id)
+            .map_err(handle_db_error)
+    })
+    .await
+    .map_err(handle_spawn_error)??;
+    
+    // 转换为NoteResponse，只返回笔记部分
+    let response = comments_with_relations.iter()
+        .map(|(note, _relation)| note_to_response(note))
+        .collect();
+        
+    Ok(Json(response))
+}
+
+// 添加评论
+#[post("/notes/<note_id>/comments", data = "<payload>", format = "json")]
+async fn add_comment(db_state: &State<SharedDb>, note_id: i64, payload: Json<CreateCommentPayload>) -> Result<Created<Json<NoteResponse>>, Status> {
+    let db_arc = db_state.inner().clone();
+    let comment_payload = payload.into_inner();
+    
+    let (created_note, _relation) = task::spawn_blocking(move || {
+        let mut conn = db_arc.lock().map_err(|_| Status::InternalServerError)?;
+        db::add_comment_db(&mut conn, note_id, comment_payload)
+            .map_err(handle_db_error)
+    })
+    .await
+    .map_err(handle_spawn_error)??;
+    
+    Ok(Created::new(format!("/inbox/notes/{}/comments", note_id))
+       .body(Json(note_to_response(&created_note))))
+}
+
+// 创建笔记关系
+#[post("/notes/<source_id>/relations/<target_id>", data = "<payload>", format = "json")]
+async fn create_relation(db_state: &State<SharedDb>, source_id: i64, target_id: i64, payload: Json<CreateNoteRelationPayload>) -> Result<Created<Json<NoteRelation>>, Status> {
+    let db_arc = db_state.inner().clone();
+    let relation_payload = payload.into_inner();
+    
+    let created_relation = task::spawn_blocking(move || {
+        let mut conn = db_arc.lock().map_err(|_| Status::InternalServerError)?;
+        db::create_note_relation_db(&mut conn, source_id, target_id, relation_payload)
+            .map_err(handle_db_error)
+    })
+    .await
+    .map_err(handle_spawn_error)??;
+    
+    Ok(Created::new(format!("/inbox/notes/{}/relations/{}", source_id, target_id))
+       .body(Json(created_relation)))
+}
+
+// 获取笔记的所有关系
+#[get("/notes/<note_id>/relations")]
+async fn get_relations(db_state: &State<SharedDb>, note_id: i64) -> Result<Json<Vec<NoteRelation>>, Status> {
+    let db_arc = db_state.inner().clone();
+    
+    let relations = task::spawn_blocking(move || {
+        let conn = db_arc.lock().map_err(|_| Status::InternalServerError)?;
+        db::get_relations_for_note_db(&conn, note_id, None)
+            .map_err(handle_db_error)
+    })
+    .await
+    .map_err(handle_spawn_error)??;
+    
+    Ok(Json(relations))
+}
+
 // mount_rocket remains the same
 pub fn mount_rocket(rocket: Rocket<Build>, db: SharedDb) -> Rocket<Build> {
     println!("[INFO] 开始注册 Inbox Server 路由...");
@@ -99,6 +174,11 @@ pub fn mount_rocket(rocket: Rocket<Build>, db: SharedDb) -> Rocket<Build> {
         delete_note,
         get_tags,
         get_detailed_tags,
+        // 评论和关系相关路由
+        get_comments,
+        add_comment,
+        create_relation,
+        get_relations,
     ]);
 
     println!("[INFO] Inbox Server 路由注册完成");

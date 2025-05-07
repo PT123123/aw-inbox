@@ -59,26 +59,34 @@ pub struct DetailedTag {
     pub last_modified: Option<DateTime<Utc>>, // <<< Changed from Option<String>
 }
 
-// 用于数据库交互和 API 响应的 Comment 结构体
-// Removed FromRow
+// 笔记关系类型枚举
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum NoteRelationType {
+    Comment,  // 评论关系
+    Reference, // 引用关系
+    Link,      // 链接关系
+    // 可以根据需要添加更多关系类型
+}
+
+// 用于数据库交互的笔记关系结构体
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Comment {
+pub struct NoteRelation {
     pub id: i64,
-    pub note_id: i64,
-    pub content: String,
+    pub source_note_id: i64,  // 源笔记ID（如评论笔记）
+    pub target_note_id: i64,  // 目标笔记ID（如被评论的笔记）
+    pub relation_type: NoteRelationType, // 关系类型
     pub created_at: DateTime<Utc>,
 }
 
-// 用于创建评论的请求体结构 (Remains the same)
+// 用于创建笔记关系的请求体结构
 #[derive(Deserialize, Debug)]
-pub struct CreateCommentPayload {
-    pub content: String,
+pub struct CreateNoteRelationPayload {
+    pub relation_type: NoteRelationType,  // 关系类型（默认为Comment）
 }
 
-// 用于 API 响应的评论结构 (Remains the same)
-#[derive(Serialize, Debug)]
-pub struct CommentResponse {
-    pub id: i64,
-    pub content: String,
-    pub created_at: String, // ISO 8601 格式字符串
+// 用于创建评论的请求体结构 (与CreateNotePayload结合)
+#[derive(Deserialize, Debug)]
+pub struct CreateCommentPayload {
+    pub content: String,        // 评论内容
+    pub tags: Option<Vec<String>>, // 评论标签（可选）
 }
